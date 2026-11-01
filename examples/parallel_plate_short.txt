@@ -1,0 +1,19 @@
+# Parallel-plate line driven by a matched sheet port, shorted at the far end.
+# The wave reflected by the short returns to the port and is absorbed by its
+# internal resistance (no second echo).
+grid  80 40 30
+cell  0.5e-3 0.5e-3 0.5e-3
+cfl   2
+steps 400
+pml   8  type=uniaxial order=3 r0=1e-4
+
+conductor 10 60 10 30 13 13        # bottom plate (z = 13)
+conductor 10 60 10 30 17 17        # top plate    (z = 17)
+conductor 60 60 10 30 13 17        # short-circuit wall at x = 60
+
+# sheet port across the line at x = 12: Ez between the plates
+port 12 12 10 30 13 17 dir=+z amp=100 R=36 wave=modgauss f0=20e9 tau=4e-11 name=in
+
+outdir output_pp
+output E comp=z   plane=xy index=15 interval=4 file=Ez_xy.gif
+output H comp=mag plane=xz index=20 interval=4 file=H_mag_xz.gif
