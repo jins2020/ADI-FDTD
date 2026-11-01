@@ -68,7 +68,6 @@ class Recorder:
         os.makedirs(self.outdir, exist_ok=True)
         sim = self.sim
         files = []
-        geo = geometry_map(sim)
         for k, o in enumerate(self.outputs):
             frames = self.frames[k]
             if not frames:
@@ -81,27 +80,43 @@ class Recorder:
             else:
                 cmap, vmin = "RdBu_r", -vmax
             a1, a2 = o.plane[0], o.plane[1]
-            g = _plane_slice(geo, o.plane, o.index)
-            fig, ax = plt.subplots(figsize=(6, 5))
-            im = ax.imshow(stack[0].T, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax,
-                           interpolation="nearest", aspect=sim.d[AX[a2]] / sim.d[AX[a1]])
+            i1, i2 = AX[a1], AX[a2]
+            g = _plane_slice(sim.mat.geo, o.plane, o.index)
+            grid = sim.g
+            X = grid.nodes[i1] * 1e3
+            Y = grid.nodes[i2] * 1e3
+            xc = grid.centers[i1] * 1e3
+            yc = grid.centers[i2] * 1e3
+            w = X[-1] - X[0]
+            hgt = Y[-1] - Y[0]
+            fw = 6.5
+            fig, ax = plt.subplots(figsize=(fw, max(2.5, min(9.0, fw * hgt / w * 0.85 + 0.6))))
+            im = ax.pcolormesh(X, Y, stack[0].T, cmap=cmap, vmin=vmin, vmax=vmax, shading="flat")
+            ax.set_aspect("equal")
             unit = "V/m" if o.field == "E" else "A/m"
             label = f"|{o.field}|" if o.comp == "mag" else f"{o.field}{o.comp}"
-            fig.colorbar(im, ax=ax, label=f"{label} [{unit}]")
-            # geometry: conductor (1), dielectric (2), port (3)
+            fig.colorbar(im, ax=ax, label=f"{label} [{unit}]", shrink=0.85)
+            # geometry: conductor (black), material (lime), port (cyan)
             for lvl, col in ((1, "k"), (2, "lime"), (3, "cyan")):
                 m = (g == lvl).T.astype(float)
-                if m.any():
-                    ax.contour(m, levels=[0.5], colors=col, linewidths=0.8)
-            _draw_pml(ax, sim, a1, a2)
-            ax.set_xlabel(f"{a1} [cell]")
-            ax.set_ylabel(f"{a2} [cell]")
+                if m.any() and min(m.shape) > 1:
+                    ax.contour(xc, yc, m, levels=[0.5], colors=col, linewidths=0.8)
+            _draw_pml(ax, sim, i1, i2)
+            if not grid.uniform and o.grid_lines:
+                for v in X:
+                    ax.axvline(v, color="0.5", lw=0.15)
+                for v in Y:
+                    ax.axhline(v, color="0.5", lw=0.15)
+            ax.set_xlabel(f"{a1} [mm]")
+            ax.set_ylabel(f"{a2} [mm]")
             normal = ({"x", "y", "z"} - set(o.plane)).pop()
-            title = ax.set_title("")
+            npos = grid.centers[AX[normal]][o.index] * 1e3
+            title = ax.set_title("", fontsize=10)
+            fig.tight_layout()
 
             def update(i):
-                im.set_data(stack[i].T)
-                title.set_text(f"{label}  {o.plane}-plane {normal}={o.index}  "
+                im.set_array(stack[i].T.ravel())
+                title.set_text(f"{label}  {o.plane}-plane {normal}={npos:.2f} mm  "
                                f"t={self.times[k][i]:.3e} s")
                 return im, title
 
@@ -113,34 +128,11 @@ class Recorder:
         return files
 
 
-def _draw_pml(ax, sim, a1, a2):
+def _draw_pml(ax, sim, i1, i2):
     p = sim.cfg.pml
-    i1, i2 = AX[a1], AX[a2]
-    lo1, hi1 = p[2 * i1], sim.N[i1] - p[2 * i1 + 1]
-    lo2, hi2 = p[2 * i2], sim.N[i2] - p[2 * i2 + 1]
-    xs = [lo1 - 0.5, hi1 - 0.5, hi1 - 0.5, lo1 - 0.5, lo1 - 0.5]
-    ys = [lo2 - 0.5, lo2 - 0.5, hi2 - 0.5, hi2 - 0.5, lo2 - 0.5]
-    ax.plot(xs, ys, "w--", lw=0.7)
-
-
-def geometry_map(sim):
-    """Cell-centred integer map: 0 vacuum, 1 conductor, 2 dielectric, 3 port."""
-    g = np.zeros(sim.N, dtype=np.int8)
-
-    def cells(box):
-        sl = []
-        for a, (lo, hi) in enumerate(box.ranges()):
-            if hi > lo:
-                sl.append(slice(lo, hi))
-            else:                       # zero-thickness sheet: mark one cell layer
-                lo = min(lo, sim.N[a] - 1)
-                sl.append(slice(lo, lo + 1))
-        return tuple(sl)
-
-    for d in sim.cfg.dielectrics:
-        g[cells(d.box)] = 2
-    for b in sim.cfg.conductors:
-        g[cells(b)] = 1
-    for p in sim.cfg.ports:
-        g[cells(p.box)] = 3
-    return g
+    g = sim.g
+    x = g.nodes[i1] * 1e3
+    y = g.nodes[i2] * 1e3
+    lo1, hi1 = x[p[2 * i1]], x[g.N[i1] - p[2 * i1 + 1]]
+    lo2, hi2 = y[p[2 * i2]], y[g.N[i2] - p[2 * i2 + 1]]
+    ax.plot([lo1, hi1, hi1, lo1, lo1], [lo2, lo2, hi2, hi2, lo2], "--", color="0.55", lw=0.7)

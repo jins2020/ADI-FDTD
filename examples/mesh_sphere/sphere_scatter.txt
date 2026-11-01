@@ -1,0 +1,21 @@
+# Magneto-dielectric sphere (eps_r = 2, mu_r = 3) read from an STL surface mesh,
+# illuminated by a gap-fed dipole. Uniform grid, structures in physical coordinates.
+grid   70 50 50
+cell   1e-3
+origin -0.035 -0.025 -0.025
+cfl    2
+steps  170
+pml    8
+
+# dipole arms (thin PEC wires along z) in physical coordinates [m]
+conductor -0.020 -0.020 0 0 -0.010 -0.001  coords=phys
+conductor -0.020 -0.020 0 0  0.001  0.010  coords=phys
+port      -0.020 -0.020 0 0 -0.001  0.001  coords=phys dir=+z amp=500 R=50 wave=modgauss f0=10e9 tau=6e-11 name=feed
+
+# sphere: closed STL surface (mm) -> volume region with material properties
+stl    file=sphere.stl scale=1e-3 offset=0.005,0,0 type=material eps=2.0 mu=3.0 subcell=3
+
+outdir output_sphere
+output E comp=mag plane=xz pos=0 interval=2 file=E_mag_xz.gif
+output H comp=mag plane=xz pos=0 interval=2 file=H_mag_xz.gif
+output E comp=z   plane=xy pos=0 interval=2 file=Ez_xy.gif

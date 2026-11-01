@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adifdtd"
+version = "0.2.0"
+description = "3D ADI-FDTD solver: non-uniform grid, eps/mu media, matched-loss PML, resistive ports, Gmsh/STL geometry"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.22", "matplotlib>=3.5", "pillow>=9.0"]
+
+[project.optional-dependencies]
+mesh = ["gmsh>=4.11"]
+
+[project.scripts]
+adifdtd = "adifdtd.__main__:main"
+
+[tool.setuptools]
+packages = ["adifdtd"]

@@ -39,6 +39,20 @@ def test_unconditional_stability():
         assert rho < 1 + 1e-9, (cfl, rho)
 
 
+def test_stability_nonuniform_magnetic():
+    """Non-uniform grid, eps/mu/sigma/sigma_m, isotropic and uniaxial PML."""
+    for typ, cfl in (("uniaxial", 30.0), ("isotropic", 200.0)):
+        cfg = SimConfig(cfl=cfl, pml=(2, 1, 1, 1, 0, 1), pml_type=typ,
+                        lines=[(0.0, [(3e-3, 3, 1.0), (5e-3, 4, 0.3)]),
+                               (0.0, [(2e-3, 2, 1.0), (6e-3, 4, 2.5)]),
+                               (0.0, [(1e-3, 4, 1.0)])],
+                        dielectrics=[Dielectric(Box(2, 6, 1, 4, 1, 3), 3.0, 0.02, 5.0, 300.0)],
+                        conductors=[Box(5, 5, 2, 5, 0, 2)],
+                        ports=[Port(Box(3, 3, 3, 3, 1, 3), 2, 1.0, 0.0, 50.0, "gauss", {}, "p")])
+        rho = _spectral_radius(cfg)
+        assert rho < 1 + 1e-9, (typ, cfl, rho)
+
+
 def test_pec_and_port_run(tmp_path=None):
     here = os.path.dirname(__file__)
     cfg = parse_input(os.path.join(here, "..", "examples", "dipole.txt"))
@@ -57,5 +71,6 @@ def test_pec_and_port_run(tmp_path=None):
 
 if __name__ == "__main__":
     test_unconditional_stability()
+    test_stability_nonuniform_magnetic()
     test_pec_and_port_run()
     print("all tests passed")

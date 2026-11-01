@@ -1,4 +1,5 @@
-"""3D ADI-FDTD solver with a graded matched-loss PML and matched resistive ports.
+"""3D ADI-FDTD solver: non-uniform rectilinear grid, eps/mu materials,
+graded matched-loss PML and matched resistive ports.
 
 Scheme
 ------
@@ -9,38 +10,34 @@ Sub-step 1 (n -> n+1/2), implicit derivative pairs (sign +1):
 Sub-step 2 (n+1/2 -> n+1), implicit derivative pairs (sign -1):
     Ex <- dHy/dz,  Ey <- dHz/dx,  Ez <- dHx/dy
 The other derivative of each equation is explicit (previous half step).
-Eliminating H from each implicit pair gives tridiagonal systems, solved with
-a pre-factorised (Thomas) algorithm along each grid line.
+Eliminating H from each implicit pair gives tridiagonal systems along grid
+lines, solved with a pre-factorised Thomas algorithm.
 
-All losses (PML, dielectric conductivity, port resistance) are diagonal and
-time-averaged (Crank-Nicolson) in both sub-steps. With
-    A' = A - S/2,  B' = B - S/2      (A, B skew in the eps/mu energy norm, S >= 0)
-each sub-step operator is dissipative in the *same* norm, so the scheme is
-unconditionally stable for any dt.
+Media: eps_r, sigma (electric loss) on E edges, mu_r, sigma_m (magnetic
+loss) on H faces. All losses are diagonal and time-averaged in both
+sub-steps. With A' = A - S/2, B' = B - S/2 (A, B skew in the volume- and
+eps/mu-weighted energy norm, S >= 0) every sub-step is dissipative in the
+same norm: the scheme is unconditionally stable on non-uniform grids too.
+
+Derivatives on the non-uniform grid:
+    dH/dw at an E node   : (H[j] - H[j-1]) / dd[j]   (dual spacing)
+    dE/dw at an H point  : (E[j+1] - E[j]) / dp[j]   (primal spacing)
 
 PML
 ---
-Graded, impedance-matched conductive layer (sigma_e/eps = sigma_m/mu):
-    uniaxial  (default): in a layer normal to axis d, only the field
-                         components tangential to the layer (c != d) are lossy.
-                         This is exact for normal incidence and equals the
-                         UPML tensor apart from its 1/s_d normal component.
-    isotropic          : every component is lossy.
-Unsplit stretched-coordinate (CPML) or split-field (Berenger) PMLs are not
-used: combined with ADI their split operators lose the common energy norm
-and grow exponentially at large time steps.
-
-Grid (Yee), Nx*Ny*Nz cells, nodes 0..N:
-    Ex (Nx, Ny+1, Nz+1)  Ey (Nx+1, Ny, Nz+1)  Ez (Nx+1, Ny+1, Nz)
-    Hx (Nx+1, Ny, Nz)    Hy (Nx, Ny+1, Nz)    Hz (Nx, Ny, Nz+1)
-Outer boundary is PEC (behind the PML).
+Graded impedance-matched conductive layer (sigma_e/eps = sigma_m/mu, also
+inside dielectric/magnetic media):
+    uniaxial (default): in a layer normal to axis d only the tangential
+                        components (c != d) are lossy.
+    isotropic         : every component is lossy.
+(CPML/split-field PMLs lose the common energy norm under ADI and grow
+exponentially at large time steps, so they are not used.)
 
 Port
 ----
-Lumped resistive source. On the port edges
+Lumped resistive source on the port edges:
     eps dE/dt + sigma_p E = curl H + sigma_p * E_s(t)
-with sigma_p chosen such that the total port resistance is R. A port whose
-R matches the line impedance absorbs the returning wave (no re-reflection).
+sigma_p gives a total port resistance R. A matched R absorbs returning waves.
 """
 from __future__ import annotations
 
@@ -48,7 +45,9 @@ import math
 
 import numpy as np
 
-from .inputfile import SimConfig
+from .geometry import GEO_PORT, Materials
+from .inputfile import SimConfig, finalize
+from .meshfile import read_mesh
 from .waveforms import make_waveform
 
 EPS0 = 8.8541878128e-12
@@ -72,22 +71,28 @@ def _mv(a, d):
     return np.moveaxis(a, d, 0)
 
 
-class ADIFDTD:
-    def __init__(self, cfg: SimConfig):
-        self.cfg = cfg
-        self.dtype = np.dtype(cfg.dtype)
-        self.N = tuple(cfg.shape)
-        self.d = tuple(float(v) for v in cfg.cell)
-        Nx, Ny, Nz = self.N
-        dx, dy, dz = self.d
+def _col(v):
+    return v.reshape(-1, 1, 1)
 
-        self.dt_cfl = 1.0 / (C0 * math.sqrt(1 / dx**2 + 1 / dy**2 + 1 / dz**2))
+
+class ADIFDTD:
+    def __init__(self, cfg: SimConfig, verbose: bool = False):
+        if cfg.grid is None:
+            finalize(cfg)
+        self.cfg = cfg
+        self.verbose = verbose
+        self.g = g = cfg.grid
+        self.dtype = np.dtype(cfg.dtype)
+        self.N = g.N
+        self.d = g.dmin                       # smallest spacing per axis
+        Nx, Ny, Nz = self.N
+
+        self.dt_cfl = 1.0 / (C0 * math.sqrt(sum(1 / v**2 for v in self.d)))
         self.dt = cfg.dt if cfg.dt is not None else cfg.cfl * self.dt_cfl
-        self.h = 0.5 * self.dt   # sub-step length
+        self.h = 0.5 * self.dt
 
         self.eshape = [(Nx, Ny + 1, Nz + 1), (Nx + 1, Ny, Nz + 1), (Nx + 1, Ny + 1, Nz)]
         self.hshape = [(Nx + 1, Ny, Nz), (Nx, Ny + 1, Nz), (Nx, Ny, Nz + 1)]
-
         self.E = [np.zeros(self.eshape[c], self.dtype) for c in range(3)]
         self.H = [np.zeros(self.hshape[c], self.dtype) for c in range(3)]
 
@@ -99,116 +104,140 @@ class ADIFDTD:
         self.n = 0
 
     # ------------------------------------------------------------------ setup
+    def _log(self, msg):
+        if self.verbose:
+            print(msg, flush=True)
+
     def _build_materials(self):
-        cfg, N = self.cfg, self.N
-        eps_cell = np.ones(N)
-        sig_cell = np.zeros(N)
-        for diel in cfg.dielectrics:
-            (i0, i1), (j0, j1), (k0, k1) = diel.box.ranges()
-            eps_cell[i0:i1, j0:j1, k0:k1] = diel.eps_r
-            sig_cell[i0:i1, j0:j1, k0:k1] = diel.sigma
-        self.eps_cell, self.sig_cell = eps_cell, sig_cell
+        cfg, g = self.cfg, self.g
+        M = Materials(g)
+        for d in cfg.dielectrics:
+            M.add_box_material(d.box, d.props())
+        for b in cfg.conductors:
+            M.add_box_pec(b)
+        meshes = {}
+        pec_ops = []
+        for kind, obj in cfg.shapes:
+            if kind == "mat":
+                M.add_box_material(obj.box, obj.props())
+            elif kind == "pec":
+                pec_ops.append(("box", obj))
+            else:
+                key = (obj.file, obj.scale, obj.offset)
+                if key not in meshes:
+                    meshes[key] = read_mesh(obj.file).transformed(obj.scale, obj.offset)
+                    self._log(f"mesh {obj.file}\n{meshes[key].summary()}")
+                region = meshes[key].find(obj.region)
+                if obj.kind == "pec":
+                    pec_ops.append(("mesh", (meshes[key], region)))
+                else:
+                    M.add_mesh_region(meshes[key], region, "material", obj.props, obj.subcell)
+        for kind, obj in pec_ops:      # PEC after materials: always wins
+            if kind == "box":
+                M.add_box_pec(obj)
+            else:
+                M.add_mesh_region(obj[0], obj[1], "pec", {})
+        self.mat = M
 
-        # edge values = average of the 4 cells sharing the edge
-        self.eps_e, self.sig_e, self.pec = [], [], []
+        # outer PEC walls: tangential E on the domain faces
         for c in range(3):
-            pad = [(0, 0) if a == c else (1, 1) for a in range(3)]
-            pe = np.pad(eps_cell, pad, mode="edge")
-            ps = np.pad(sig_cell, pad, mode="edge")
-            t = [a for a in range(3) if a != c]
-            acc_e = np.zeros(self.eshape[c])
-            acc_s = np.zeros(self.eshape[c])
-            for o1 in (0, 1):
-                for o2 in (0, 1):
+            for a in range(3):
+                if a != c:
                     sl = [slice(None)] * 3
-                    sl[t[0]] = slice(o1, o1 + self.eshape[c][t[0]])
-                    sl[t[1]] = slice(o2, o2 + self.eshape[c][t[1]])
-                    acc_e += pe[tuple(sl)]
-                    acc_s += ps[tuple(sl)]
-            self.eps_e.append(acc_e / 4.0)
-            self.sig_e.append(acc_s / 4.0)
+                    sl[a] = 0
+                    M.pec[c][tuple(sl)] = True
+                    sl[a] = -1
+                    M.pec[c][tuple(sl)] = True
+        self.pec = M.pec
+        self.eps_e = [M.edge_average(M.eps, c) for c in range(3)]
+        self.sig_e = [M.edge_average(M.sig, c) for c in range(3)]
+        self.mu_h = [M.face_harmonic(M.mu, c) for c in range(3)]
+        self.sigm_h = [M.face_mean(M.sigm, c) for c in range(3)]
 
-            mask = np.zeros(self.eshape[c], dtype=bool)
-            for a in t:                        # outer PEC walls (tangential E)
-                sl = [slice(None)] * 3
-                sl[a] = 0
-                mask[tuple(sl)] = True
-                sl[a] = -1
-                mask[tuple(sl)] = True
-            for b in cfg.conductors:
-                sl = []
-                for a, (lo, hi) in enumerate(b.ranges()):
-                    # edge centre (i+1/2 along c, node otherwise) inside [lo, hi]
-                    sl.append(slice(lo, hi) if a == c else slice(lo, hi + 1))
-                mask[tuple(sl)] = True
-            self.pec.append(mask)
+        # cell volumes associated with each component (energy norm)
+        dp, dd = g.dp, g.dd
+        def vol(c, along, across):
+            t = [a for a in range(3) if a != c]
+            return _bshape(along[c], c) * _bshape(across[t[0]], t[0]) * _bshape(across[t[1]], t[1])
+        self.vol_e = [vol(c, dp, dd) for c in range(3)]
+        self.vol_h = [vol(c, dd, dp) for c in range(3)]
 
     def pml_sigma(self, a, half):
-        """Graded PML conductivity along axis a (at nodes or half nodes)."""
-        Na, da = self.N[a], self.d[a]
+        """Graded PML conductivity along axis a at nodes (half=False) or cell centres."""
+        g = self.g
+        x = g.centers[a] if half else g.nodes[a]
         Lmin, Lmax = self.cfg.pml[2 * a], self.cfg.pml[2 * a + 1]
         m, R0 = self.cfg.pml_order, self.cfg.pml_R0
-        u = np.arange(Na) + 0.5 if half else np.arange(Na + 1).astype(float)
-        sig = np.zeros_like(u)
-        for L, depth in ((Lmin, Lmin - u), (Lmax, u - (Na - Lmax))):
+        sig = np.zeros_like(x)
+        xn = g.nodes[a]
+        N = g.N[a]
+        for L, inner, sgn in ((Lmin, xn[Lmin], -1.0), (Lmax, xn[N - Lmax], +1.0)):
             if L > 0:
-                smax = -(m + 1) * math.log(R0) / (2 * ETA0 * L * da)
-                sig = np.maximum(sig, smax * np.clip(depth / L, 0, 1) ** m)
+                outer = xn[0] if sgn < 0 else xn[-1]
+                thick = abs(outer - inner)
+                smax = -(m + 1) * math.log(R0) / (2 * ETA0 * thick)
+                depth = np.clip(sgn * (x - inner) / thick, 0, 1)
+                sig = np.maximum(sig, smax * depth**m)
         return sig
 
     def _pml_field_sigma(self, c, electric):
-        """PML conductivity (vacuum value) on the grid of component c."""
         shape = self.eshape[c] if electric else self.hshape[c]
         s = np.zeros(shape)
         axes = range(3) if self.cfg.pml_type == "isotropic" else [a for a in range(3) if a != c]
         for a in axes:
-            # E_c: half-integer along c, integer otherwise; H_c: the opposite
             half = (a == c) if electric else (a != c)
             s = s + _bshape(self.pml_sigma(a, half), a)
         return s
 
     def _build_ports(self):
+        g = self.g
         self.ports = []
         self.sig_port = [np.zeros(self.eshape[c]) for c in range(3)]
-        dx = self.d
         for p in self.cfg.ports:
             c = p.axis
             sl = tuple(slice(lo, hi) if a == c else slice(lo, hi + 1)
                        for a, (lo, hi) in enumerate(p.box.ranges()))
-            nL = p.box.ranges()[c][1] - p.box.ranges()[c][0]
+            nL = sl[c].stop - sl[c].start
             ncell = int(np.prod([s.stop - s.start for s in sl]))
             nA = ncell // nL
-            area = np.prod([dx[a] for a in range(3) if a != c])
-            R_edge = p.R * nA / nL           # nA parallel strings of nL edges
-            sig = dx[c] / (R_edge * area)
+            t = [a for a in range(3) if a != c]
+            length = _bshape(g.dp[c][sl[c]], c)                        # edge lengths
+            area = _bshape(g.dd[t[0]][sl[t[0]]], t[0]) * _bshape(g.dd[t[1]][sl[t[1]]], t[1])
+            R_edge = p.R * nA / nL
+            sig = np.broadcast_to(length / (R_edge * area), tuple(s.stop - s.start for s in sl))
             self.sig_port[c][sl] += sig
             self.pec[c][sl] = False
-            self.ports.append(dict(cfg=p, comp=c, sl=sl, sig=sig, nL=nL, nA=nA,
+            self.mat.geo[self.mat._cell_slices(p.box)] = GEO_PORT
+            self.ports.append(dict(cfg=p, comp=c, sl=sl, sig=np.array(sig), nL=nL, nA=nA,
                                    wave=make_waveform(p.wave, p.params, self.dt),
-                                   length=nL * dx[c]))
+                                   lengths=np.broadcast_to(length, sig.shape).copy(),
+                                   length=float(g.dp[c][sl[c]].sum())))
 
     def _build_coefficients(self):
         h = self.h
         self.ca, self.cb, self.da, self.db = [], [], [], []
         for c in range(3):
             eps = EPS0 * self.eps_e[c]
-            # PML sigma scaled by eps_r keeps sigma/eps = sigma*/mu0 in dielectrics
-            sig = self.sig_e[c] + self.sig_port[c] + self._pml_field_sigma(c, True) * self.eps_e[c]
+            # PML sigma scaled by eps_r / mu_r keeps sigma/eps = sigma_m/mu in any medium
+            sig = (self.sig_e[c] + self.sig_port[c]
+                   + self._pml_field_sigma(c, True) * self.eps_e[c])
             k = sig * h / (2 * eps)
             self.ca.append(((1 - k) / (1 + k)).astype(self.dtype))
             self.cb.append(((h / eps) / (1 + k)).astype(self.dtype))
-            sigm = self._pml_field_sigma(c, False) * MU0 / EPS0
-            k = sigm * h / (2 * MU0)
+            mu = MU0 * self.mu_h[c]
+            sigm = self.sigm_h[c] + self._pml_field_sigma(c, False) * MU0 / EPS0 * self.mu_h[c]
+            k = sigm * h / (2 * mu)
             self.da.append(((1 - k) / (1 + k)).astype(self.dtype))
-            self.db.append(((h / MU0) / (1 + k)).astype(self.dtype))
+            self.db.append(((h / mu) / (1 + k)).astype(self.dtype))
         self.notpec = [(~m).astype(self.dtype) for m in self.pec]
 
     def _factorize(self):
         """Thomas factorisation of the 6 tridiagonal systems (implicit axis first)."""
+        g = self.g
         self.lu = {}
         for c, d, hc, s in PAIRS_STEP1 + PAIRS_STEP2:
-            F = _mv(self.cb[c], d) / self.d[d]        # (N+1, ...)
-            G = _mv(self.db[hc], d) / self.d[d]       # (N, ...)
+            F = _mv(self.cb[c], d) / _col(g.dd[d])      # (N+1, ...)
+            G = _mv(self.db[hc], d) / _col(g.dp[d])     # (N, ...)
             n = F.shape[0]
             a = np.zeros_like(F)
             b = np.ones_like(F)
@@ -228,6 +257,8 @@ class ADIFDTD:
                 cp[j] = cc[j] * inv_m[j]
             asc = lambda x: np.ascontiguousarray(x, self.dtype)
             self.lu[(c, d)] = (asc(a), asc(inv_m), asc(cp), asc(F), asc(G))
+        self.inv_dd = [_col(1.0 / g.dd[a]).astype(self.dtype) for a in range(3)]
+        self.inv_dp = [_col(1.0 / g.dp[a]).astype(self.dtype) for a in range(3)]
 
     # ------------------------------------------------------------ field access
     def Etot(self, c):
@@ -253,13 +284,12 @@ class ADIFDTD:
         """Explicit derivative terms from the fields of the previous half step."""
         tE, tH = {}, {}
         for c, d, hc, s in pairs_expl:
-            dd = self.d[d]
             Hm = _mv(self.H[hc], d)
             DH = np.zeros(_mv(self.E[c], d).shape, self.dtype)
-            DH[1:-1] = (Hm[1:] - Hm[:-1]) * (s / dd)
+            DH[1:-1] = (Hm[1:] - Hm[:-1]) * (s * self.inv_dd[d][1:-1])
             tE[c] = np.moveaxis(DH, 0, d)
             Em = _mv(self.E[c], d)
-            tH[hc] = np.moveaxis((Em[1:] - Em[:-1]) * (s / dd), 0, d)
+            tH[hc] = np.moveaxis((Em[1:] - Em[:-1]) * (s * self.inv_dp[d]), 0, d)
         return tE, tH
 
     def _implicit(self, c, d, hc, s, tE, tH, t):
@@ -306,30 +336,33 @@ class ADIFDTD:
         """(E_source, mean E on port, port voltage, port current)."""
         c, sl, q = p["comp"], p["sl"], p["cfg"]
         es = q.sign * q.amp * p["wave"](self.t)
-        e_mean = float(self.E[c][sl].mean())
-        V = e_mean * p["length"] * q.sign
-        I = (es - e_mean) * q.sign * p["length"] / q.R
+        E = self.E[c][sl]
+        e_mean = float(E.mean())
+        V = float((E * p["lengths"]).sum()) / p["nA"] * q.sign      # mean line integral
+        I = (es * p["length"] * q.sign - V) / q.R
         return es, e_mean, V, I
 
     def energy(self):
-        vol = self.d[0] * self.d[1] * self.d[2]
-        we = sum(0.5 * EPS0 * float(np.sum(self.eps_e[c] * self.E[c] ** 2)) for c in range(3))
-        wh = sum(0.5 * MU0 * float(np.sum(self.H[c] ** 2)) for c in range(3))
-        return (we + wh) * vol
+        we = sum(0.5 * EPS0 * float(np.sum(self.eps_e[c] * self.vol_e[c] * self.E[c] ** 2))
+                 for c in range(3))
+        wh = sum(0.5 * MU0 * float(np.sum(self.mu_h[c] * self.vol_h[c] * self.H[c] ** 2))
+                 for c in range(3))
+        return we + wh
 
     def summary(self):
-        Nx, Ny, Nz = self.N
         c = self.cfg
-        lines = [
-            f"grid        : {Nx} x {Ny} x {Nz} cells",
-            f"cell        : {self.d[0]:.3e} x {self.d[1]:.3e} x {self.d[2]:.3e} m",
-            f"dt          : {self.dt:.4e} s  (= {self.dt / self.dt_cfl:.2f} x Yee CFL limit)",
+        M = self.mat
+        lines = ["grid        : " + ("uniform" if self.g.uniform else "non-uniform")]
+        lines += ["  " + s for s in self.g.describe()]
+        lines += [
+            f"dt          : {self.dt:.4e} s  (= {self.dt / self.dt_cfl:.2f} x Yee CFL limit of smallest cell)",
             f"steps       : {c.steps}  (T = {c.steps * self.dt:.4e} s)",
             f"PML (cells) : {c.pml}  type={c.pml_type} order={c.pml_order} R0={c.pml_R0}",
-            f"conductors  : {len(c.conductors)}   dielectrics: {len(c.dielectrics)}",
+            f"materials   : eps_r {M.eps.min():.3g}..{M.eps.max():.3g}, mu_r {M.mu.min():.3g}..{M.mu.max():.3g}, "
+            f"PEC edges {sum(int(m.sum()) for m in self.pec)}",
         ]
         for p in self.ports:
             q = p["cfg"]
             lines.append(f"port {q.name:7s}: E{'xyz'[q.axis]} sign={q.sign:+.0f} amp={q.amp} "
-                         f"R={q.R} ohm wave={q.wave} edges={p['nL']}x{p['nA']}")
+                         f"R={q.R} ohm wave={q.wave} edges={p['nL']}x{p['nA']} L={p['length']:.3e} m")
         return "\n".join(lines)

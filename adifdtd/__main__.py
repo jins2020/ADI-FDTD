@@ -16,7 +16,7 @@ def run(path, outdir=None, quiet=False):
     cfg = parse_input(path)
     if outdir:
         cfg.outdir = outdir
-    sim = ADIFDTD(cfg)
+    sim = ADIFDTD(cfg, verbose=not quiet)
     if not quiet:
         print(sim.summary())
     os.makedirs(cfg.outdir, exist_ok=True)
