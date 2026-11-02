@@ -1,0 +1,22 @@
+# Gap-fed dipole (two thin PEC arms) radiating into open space,
+# with a dielectric block (eps_r = 4) next to it. Open boundaries = PML.
+grid  50 50 50            # Nx Ny Nz (cells)
+cell  1e-3 1e-3 1e-3      # dx dy dz [m]
+cfl   3                   # dt = 3 x Yee CFL limit (ADI is unconditionally stable)
+steps 150
+pml   8                   # 8 cells on all 6 faces
+pml_type uniaxial
+pml_order 3
+pml_reflection 1e-4
+
+conductor  25 25 25 25 13 24        # lower arm (thin wire along z)
+conductor  25 25 25 25 26 37        # upper arm
+dielectric 32 40 12 38 12 38 eps=4.0 sigma=0
+
+# lumped port in the 2-cell gap: Ez, +z direction, 1000 V/m, 50 ohm internal resistance
+port 25 25 25 25 24 26 dir=+z amp=1000 R=50 wave=modgauss f0=10e9 tau=6e-11 name=feed
+
+outdir output_dipole
+output E comp=mag plane=xz index=25 interval=3 file=E_mag_xz.gif
+output E comp=z   plane=xy index=25 interval=3 file=Ez_xy.gif
+output H comp=mag plane=xy index=25 interval=3 file=H_mag_xy.gif fps=12

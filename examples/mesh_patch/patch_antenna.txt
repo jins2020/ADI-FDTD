@@ -1,0 +1,28 @@
+# Probe-fed microstrip patch antenna. Structure is read from an external
+# unstructured mesh (Gmsh, patch.msh, units mm). The FDTD grid is a
+# non-uniform rectilinear grid refined in the substrate (z) and around the patch.
+
+# ---- non-uniform grid:  xlines x0  x1:n1[:ratio]  x2:n2[:ratio] ...  (metres)
+#      ratio = last cell / first cell of the segment (geometric grading)
+xlines -0.050  -0.022:12:0.25  0.022:44  0.050:12:4
+ylines -0.050  -0.022:12:0.25  0.022:44  0.050:12:4
+zlines -0.030  -0.002:10:0.2   0.0:4  0.0016:4  0.004:5  0.032:10:5
+
+dt     5e-12            # ~4.3 x CFL limit of the smallest cell (0.4 mm)
+steps  800
+pml    8   type=uniaxial order=3 r0=1e-4
+
+# ---- structure from the mesh file (later lines overwrite earlier ones, PEC wins)
+mesh   file=patch.msh scale=1e-3 subcell=2
+region substrate type=material eps=4.4 mu=1 sigma=0.015     # FR-4 (tan d ~ 0.02 @ 3 GHz)
+region ground    type=pec        # surface triangles -> PEC sheet
+region patch     type=pec
+region probe     type=pec        # line element   -> PEC wire (feed pin)
+
+# ---- feed: lumped port in the 0.4 mm gap between ground and pin (physical coords)
+port 0 0  -0.005 -0.005  0 0.0004  coords=phys dir=+z amp=2500 R=50 wave=modgauss f0=3.2e9 tau=2.5e-10 name=feed
+
+outdir output_patch
+output E comp=z   plane=xy pos=0.0008 interval=8 file=Ez_substrate_xy.gif
+output E comp=mag plane=yz pos=0.0    interval=8 file=E_mag_yz.gif
+output H comp=mag plane=xy pos=0.0030 interval=8 file=H_mag_above_xy.gif
